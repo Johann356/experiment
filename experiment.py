@@ -38,7 +38,7 @@ class PatchFFT(nn.Module):
         self.L = L
         self.channel_num = channel_num
         self.d_model = self.patch_size*(self.patch_size//2+1) #14*8=112
-        self.positional_embedding = PositionalEncoding(self.d_model, max_len=L)        # 单份
+        # self.positional_embedding = PositionalEncoding(self.d_model, max_len=L)        # 单份
 
 
 
@@ -49,16 +49,19 @@ class PatchFFT(nn.Module):
         """
         B, C, H, W = x.shape
         ps = self.patch_size
-        pn = (H // ps) * (W // ps)              # 256
-
-        # 1. unfold
-        x = x.unfold(2, ps, ps).unfold(3, ps, ps)
-        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()
-        x = x.view(-1, C, ps, ps)               # [B*pn, C, ps, ps]
+        pn = (H // ps) * (W // ps)
+        # 1. RGB转灰度（保持维度）
+        gray = x[:, 0:1, :, :] * 0.299 + x[:, 1:2, :, :] * 0.587 + x[:, 2:3, :, :] * 0.114
+        # gray shape: [B, 1, H, W]
+        
+        # 2. unfold
+        x = gray.unfold(2, ps, ps).unfold(3, ps, ps)  # [B, 1, H/ps, W/ps, ps, ps]
+        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()  # [B, H/ps, W/ps, 1, ps, ps]
+        x = x.view(-1, ps, ps)                    # [B*pn, ps,ps]
 
         # 2. FFT
         freq = torch.fft.rfft2(x, norm='ortho')
-        freq = torch.fft.fftshift(freq) 
+        freq = torch.fft.fftshift(freq)
         '''
         这里可以尝试用diagonal scan
         '''
@@ -66,26 +69,26 @@ class PatchFFT(nn.Module):
         ang = torch.angle(freq)
 
         # 3. log
-        amp = torch.log1p(1 + amp)              # [B*pn, C, ps, ps//2+1]
+        amp = torch.log1p(1 + amp)              # [B*pn, ps, ps//2+1]
         ang = ang                               # angle 不加 log
 
-        # 4. 先 reshape 成 [B*pn, C, d_model]
-        amp = amp.view(B*pn, C, -1)
-        ang = ang.view(B*pn, C, -1)
+        # 4. 先 reshape 成 [B*pn, d_model]
+        amp = amp.view(B*pn, 1, -1)
+        ang = ang.view(B*pn, 1, -1)
         '''
         先加position还是先norm?vit是先加可学习position再norm,这里和vit一样
         '''
         # 5. 先加位置编码
-        amp = self.positional_embedding(amp)    # [B*pn, C, d_model]
-        ang = self.positional_embedding(ang)
+        # amp = self.positional_embedding(amp)    # [B*pn, 1, d_model]
+        # ang = self.positional_embedding(ang)
 
         # 6. 再 norm（沿最后一维 d_model 计算均值方差）
         amp = (amp - amp.mean(dim=-1, keepdim=True)) / (amp.std(dim=-1, keepdim=True) + 1e-6)
         ang = (ang - ang.mean(dim=-1, keepdim=True)) / (ang.std(dim=-1, keepdim=True) + 1e-6)
 
         # 7. 三通道 cat
-        amp = amp.flatten(1, 2).view(B,pn,C*self.d_model)                 # [B*pn, C*d_model]
-        ang = ang.flatten(1, 2).view(B,pn,C*self.d_model) 
+        amp = amp.flatten(1, 2).view(B,pn,self.d_model)                 # [B*pn, C*d_model]
+        ang = ang.flatten(1, 2).view(B,pn,self.d_model) 
         '''
         尝试加入更多包含某一个patch的更大patch的fft特征
         '''
@@ -281,7 +284,7 @@ class VisionFrequencyTransformer(VisionTransformer):
         )
         norm_layer = get_norm_layer(norm_layer) or partial(nn.LayerNorm, eps=1e-6)
         act_layer = get_act_layer(act_layer) or nn.GELU
-        freq_dim = patch_size*(patch_size//2+1)*3
+        freq_dim = patch_size*(patch_size//2+1)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             FreqBlock(
@@ -355,9 +358,6 @@ class VisionFrequencyTransformer(VisionTransformer):
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         amp, ang = self.patchfft(x) 
-        if self.training:
-            print(f"Amp mean: {amp.mean():.4f}, std: {amp.std():.4f}")
-            print(f"Ang mean: {ang.mean():.4f}, std: {ang.std():.4f}")
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
@@ -384,6 +384,10 @@ class FreqSemanticModel(nn.Module):
             p.requires_grad_(False)
         self.classifier = Mlp(in_features=768*2,hidden_features=768,out_features=1)
         init_weights_vit_timm(self.classifier)
+    def trainable_patch_keys(self):
+        """真正需要被保存/加载的 patch 键名"""
+        return {n for n, p in self.patch_feature_extractor.named_parameters()
+                if p.requires_grad}
 
     def forward(self,x):
         patch_feature = self.patch_feature_extractor.forward_features(x)
